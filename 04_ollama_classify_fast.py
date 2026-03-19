@@ -31,6 +31,9 @@ MAX_IN_FLIGHT_BATCHES = getattr(cfg, "OLLAMA_MAX_IN_FLIGHT_BATCHES", max(8, MAX_
 WRITE_BUFFER_SIZE = getattr(cfg, "OLLAMA_WRITE_BUFFER_SIZE", 1000)
 RETURN_REASON = getattr(cfg, "OLLAMA_RETURN_REASON", False)
 USE_GENERATE_API = getattr(cfg, "OLLAMA_USE_GENERATE_API", True)
+TEXT_MAX_CHARS = getattr(cfg, "OLLAMA_TEXT_MAX_CHARS", 600)
+MAX_OUTPUT_TOKENS_PER_ITEM = getattr(cfg, "OLLAMA_MAX_OUTPUT_TOKENS_PER_ITEM", 48)
+EXTRA_OLLAMA_OPTIONS = getattr(cfg, "OLLAMA_OPTIONS", {})
 
 _thread_local = threading.local()
 
@@ -55,10 +58,9 @@ SCHEMA = {
 }
 
 SYSTEM_PROMPT = (
-    "你是一个严格的图片元数据分类器。"
-    "输入不是图片本身，而是图片的文本元数据。"
-    "你必须只返回符合 JSON Schema 的 JSON。"
-    "不要输出 markdown，不要输出解释，不要输出多余文本。"
+    "你是严格的图片元数据五分类器。"
+    "输入不是图片本身，只是文本元数据。"
+    "只输出符合 JSON Schema 的 JSON，不要输出其他内容。"
 )
 
 
@@ -107,53 +109,47 @@ def build_batch_prompt(items: list[dict]) -> str:
     for i, item in enumerate(items, start=1):
         pid = safe_str(item["photo_id"])
         txt = safe_str(item["text_for_cls"]).strip()
+        if TEXT_MAX_CHARS > 0:
+            txt = txt[:TEXT_MAX_CHARS]
         lines.append(f"[{i}] photo_id={pid}\n{txt}")
 
     samples = "\n\n".join(lines)
 
-    return f"""请把下面每一条 Unsplash 图片元数据分别归为且仅归为以下 5 类之一：
-1. 城市、建筑
-2. 室内
-3. 自然
-4. 静物
-5. 人像
+    return f"""把每条 Unsplash 元数据归为 5 类之一：
+    城市、建筑 / 室内 / 自然 / 静物 / 人像
 
-类别定义：
-- 城市、建筑：城市室外、建筑外观、街道、桥梁、地标、天际线、校园外景
-- 室内：室内空间是主体，如房间、咖啡馆、办公室、图书馆、酒店、走廊
-- 自然：山水、森林、河流、海洋、天空、花草、动植物等自然主体
-- 静物：食物、饮品、产品、器具、桌面物品、交通工具特写等物体主体
-- 人像：人是主体，包括单人、多人、半身、全身、特写、抓拍
+    判定优先级：
+    人像 > 室内 > 城市、建筑 > 自然 > 静物
 
-冲突判定优先级：
-- 如果人物是主体，优先判为“人像”
-- 否则如果室内空间是主体，判为“室内”
-- 否则如果城市室外或建筑主体明显，判为“城市、建筑”
-- 否则如果自然环境或动植物主体明显，判为“自然”
-- 否则判为“静物”
-
-请对每一条输入都返回一项结果。
-必须原样回填对应的 photo_id。
-只输出 JSON：
-{{
-  "items": [
+    要求：
+    1) 每条输入都必须返回一项结果
+    2) photo_id 必须原样回填
+    3) 只输出 JSON：
     {{
-      "photo_id": "...",
-      "label": "自然",
-      "confidence": 0.91{', "reason": "..."' if RETURN_REASON else ''}
+        "items": [
+          {{
+            "photo_id": "...",
+            "label": "自然",
+            "confidence": 0.91{', "reason": "..."' if RETURN_REASON else ''}
+          }}
+        ]
     }}
-  ]
-}}
 
-待分类样本如下：
+    待分类样本：
 
-{samples}
-""".strip()
+    {samples}
+    """.strip()
 
 
 def call_ollama_batch_once(items: list[dict]) -> list[dict]:
     session = get_session()
     prompt = build_batch_prompt(items)
+
+    options = {"temperature": 0}
+    if MAX_OUTPUT_TOKENS_PER_ITEM > 0:
+        options["num_predict"] = max(64, len(items) * MAX_OUTPUT_TOKENS_PER_ITEM)
+    if isinstance(EXTRA_OLLAMA_OPTIONS, dict):
+        options.update(EXTRA_OLLAMA_OPTIONS)
 
     if USE_GENERATE_API:
         url = f"{OLLAMA_BASE_URL}/generate"
@@ -164,7 +160,7 @@ def call_ollama_batch_once(items: list[dict]) -> list[dict]:
             "format": SCHEMA,
             "stream": False,
             "keep_alive": OLLAMA_KEEP_ALIVE,
-            "options": {"temperature": 0},
+            "options": options,
         }
     else:
         url = f"{OLLAMA_BASE_URL}/chat"
@@ -173,7 +169,7 @@ def call_ollama_batch_once(items: list[dict]) -> list[dict]:
             "stream": False,
             "keep_alive": OLLAMA_KEEP_ALIVE,
             "format": SCHEMA,
-            "options": {"temperature": 0},
+            "options": options,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
@@ -256,15 +252,13 @@ def classify_batch(items: list[dict]) -> list[dict]:
 def iter_todo_items(done_ids: set[str]):
     parquet_file = pq.ParquetFile(NEED_LLM_FILE)
     for batch in parquet_file.iter_batches(batch_size=READ_BATCH_SIZE, columns=["photo_id", "text_for_cls"]):
-        df = batch.to_pandas()
-        if done_ids:
-            df = df[~df["photo_id"].astype(str).isin(done_ids)]
-        if len(df) == 0:
-            continue
-
-        rows = df[["photo_id", "text_for_cls"]].to_dict(orient="records")
-        for row in rows:
-            yield row
+        photo_ids = batch.column(0).to_pylist()
+        texts = batch.column(1).to_pylist()
+        for raw_id, raw_text in zip(photo_ids, texts):
+            pid = safe_str(raw_id)
+            if done_ids and pid in done_ids:
+                continue
+            yield {"photo_id": pid, "text_for_cls": safe_str(raw_text)}
 
 
 def flush_jsonl(f, buffer: list[dict]) -> None:
@@ -321,6 +315,8 @@ def main() -> None:
     print(f"[INFO] MAX_WORKERS = {MAX_WORKERS}")
     print(f"[INFO] RETURN_REASON = {RETURN_REASON}")
     print(f"[INFO] USE_GENERATE_API = {USE_GENERATE_API}")
+    print(f"[INFO] TEXT_MAX_CHARS = {TEXT_MAX_CHARS}")
+    print(f"[INFO] MAX_OUTPUT_TOKENS_PER_ITEM = {MAX_OUTPUT_TOKENS_PER_ITEM}")
 
     if remain_est == 0:
         print("[INFO] 没有需要送给 Ollama 的样本。")
