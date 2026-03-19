@@ -2,7 +2,7 @@ from pathlib import Path
 
 # ========= 基本路径 =========
 # 改成你自己的 Unsplash 数据集目录
-DATA_ROOT = Path(r"YOUR_UNSPLASH_DATASET_DIR").resolve()
+DATA_ROOT = Path(r"D:/PyProjects/Dataset/unsplash-research-dataset-full-latest").resolve()
 WORK_DIR = DATA_ROOT / "work"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -10,17 +10,29 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 OLLAMA_BASE_URL = "http://localhost:11434/api"
 OLLAMA_MODEL = "gemma3"   # 可改成你本机已经 pull 好的模型
 OLLAMA_KEEP_ALIVE = "30m"
+OLLAMA_READ_BATCH_SIZE = 10000
+OLLAMA_RECORDS_PER_REQUEST = 16
+OLLAMA_MAX_IN_FLIGHT_BATCHES = 16
+OLLAMA_WRITE_BUFFER_SIZE = 1000
+
+# 速度优先时建议关掉
+OLLAMA_RETURN_REASON = False
+
+# 单轮分类更推荐 generate
+OLLAMA_USE_GENERATE_API = True
+
+# 先保守一点，别盲目拉太高
+MAX_WORKERS = 12
 REQUEST_TIMEOUT = 180
 MAX_RETRIES = 3
-MAX_WORKERS = 4
 
 # ========= 数据处理配置 =========
 PARQUET_BATCH_SIZE = 20000
 TEXT_MAX_CHARS = 1800
 
 # ========= 规则阈值 =========
-RULE_DIRECT_MIN_SCORE = 6
-RULE_DIRECT_MIN_MARGIN = 3
+RULE_DIRECT_MIN_SCORE = 4
+RULE_DIRECT_MIN_MARGIN = 2
 REVIEW_CONFIDENCE_THRESHOLD = 0.70
 
 # ========= 明确需要过滤的 art 关键词 =========

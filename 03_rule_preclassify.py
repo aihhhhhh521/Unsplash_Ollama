@@ -1,5 +1,4 @@
 from collections import defaultdict
-from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
@@ -18,14 +17,14 @@ from config import (
     RULE_WEIGHTS,
     TEXT_MAX_CHARS,
 )
-from utils import ensure_exists, norm_text, pipe_keywords_to_list, safe_str, truncate_text, json_dumps
+from utils import ensure_exists, norm_text, safe_str, truncate_text, json_dumps
+
 
 def build_text_for_cls(row: pd.Series) -> str:
     parts = []
     fields = [
         ("photo_description", row.get("photo_description")),
         ("ai_description", row.get("ai_description")),
-        ("keywords", row.get("keywords_text")),
         ("location_name", row.get("photo_location_name")),
         ("location_city", row.get("photo_location_city")),
         ("location_country", row.get("photo_location_country")),
@@ -38,11 +37,9 @@ def build_text_for_cls(row: pd.Series) -> str:
     text = "\n".join(parts)
     return truncate_text(text, TEXT_MAX_CHARS)
 
-def score_one(row: pd.Series) -> dict:
-    keywords = pipe_keywords_to_list(row.get("keywords_text"))
-    full_text = norm_text(build_text_for_cls(row))
-    keyword_set = set(keywords)
 
+def score_one(row: pd.Series) -> dict:
+    full_text = norm_text(build_text_for_cls(row))
     scores = defaultdict(int)
 
     for label, groups in CATEGORY_VOCAB.items():
@@ -51,19 +48,15 @@ def score_one(row: pd.Series) -> dict:
 
         for term in strong:
             t = term.lower()
-            if t in keyword_set:
-                scores[label] += RULE_WEIGHTS["keyword_strong"]
             if t in full_text:
                 scores[label] += RULE_WEIGHTS["text_strong"]
 
         for term in weak:
             t = term.lower()
-            if t in keyword_set:
-                scores[label] += RULE_WEIGHTS["keyword_weak"]
             if t in full_text:
                 scores[label] += RULE_WEIGHTS["text_weak"]
 
-    # 一个小修正：generic people 不要太容易压过 architecture/nature
+    # 人像做一点抑制，避免只因为出现 people/man/woman 就压过场景类
     if scores["人像"] > 0 and "portrait" not in full_text and "selfie" not in full_text and "face" not in full_text:
         scores["人像"] = max(0, scores["人像"] - 2)
 
@@ -88,21 +81,124 @@ def score_one(row: pd.Series) -> dict:
         "category_source": "rule" if direct else None,
     }
 
+
+def normalize_batch_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    关键函数：
+    把每个 batch 的 dtype 固定住，避免 ParquetWriter 因 schema 漂移报错。
+    """
+
+    # ---------- 整数列 ----------
+    int_cols = [
+        "photo_width",
+        "photo_height",
+        "stats_views",
+        "stats_downloads",
+        "rule_top1_score",
+        "rule_top2_score",
+        "rule_margin",
+    ]
+    for col in int_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+
+    # ---------- 浮点列 ----------
+    float_cols = [
+        "photo_aspect_ratio",
+        "exif_iso",
+        "photo_location_latitude",
+        "photo_location_longitude",
+        "ai_primary_landmark_latitude",
+        "ai_primary_landmark_longitude",
+        "ai_primary_landmark_confidence",
+        "category_confidence",
+    ]
+    for col in float_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+
+    # ---------- 布尔列 ----------
+    bool_cols = [
+        "photo_featured",
+        "needs_llm",
+    ]
+    for col in bool_cols:
+        if col in df.columns:
+            df[col] = df[col].astype("boolean")
+
+    # ---------- 字符串列 ----------
+    string_cols = [
+        "photo_id",
+        "photo_url",
+        "photo_image_url",
+        "photo_description",
+        "photographer_username",
+        "photographer_first_name",
+        "photographer_last_name",
+        "exif_camera_make",
+        "exif_camera_model",
+        "exif_aperture_value",
+        "exif_focal_length",
+        "exif_exposure_time",
+        "photo_location_name",
+        "photo_location_country",
+        "photo_location_city",
+        "ai_description",
+        "ai_primary_landmark_name",
+        "blur_hash",
+        "text_for_cls",
+        "rule_top1_label",
+        "rule_scores_json",
+        "category",
+        "category_source",
+    ]
+    for col in string_cols:
+        if col in df.columns:
+            df[col] = df[col].astype("string")
+
+    # photo_submitted_at 保持 datetime
+    if "photo_submitted_at" in df.columns:
+        df["photo_submitted_at"] = pd.to_datetime(df["photo_submitted_at"], errors="coerce")
+
+    return df
+
+
 def main() -> None:
     ensure_exists(PHOTOS_NO_ART_FILE, "请先运行 02_filter_art.py")
+
+    # 如果之前跑炸过，建议手动先删掉旧文件
+    if PRECLASSIFIED_FILE.exists():
+        print(f"[WARN] 检测到旧文件，将覆盖写入：{PRECLASSIFIED_FILE}")
+        PRECLASSIFIED_FILE.unlink()
+
+    if NEED_LLM_FILE.exists():
+        print(f"[WARN] 检测到旧文件，将覆盖写入：{NEED_LLM_FILE}")
+        NEED_LLM_FILE.unlink()
 
     parquet_file = pq.ParquetFile(PHOTOS_NO_ART_FILE)
     writer_all = None
     llm_rows = []
 
+    fixed_schema = None
+
     for batch in tqdm(parquet_file.iter_batches(batch_size=PARQUET_BATCH_SIZE), desc="rule_preclassify"):
         df = batch.to_pandas()
+
         extra = df.apply(score_one, axis=1, result_type="expand")
         out = pd.concat([df, extra], axis=1)
 
+        # 统一 dtype，避免不同 batch schema 漂移
+        out = normalize_batch_dtypes(out)
+
         table = pa.Table.from_pandas(out, preserve_index=False)
-        if writer_all is None:
-            writer_all = pq.ParquetWriter(PRECLASSIFIED_FILE, table.schema, compression="zstd")
+
+        if fixed_schema is None:
+            fixed_schema = table.schema
+            writer_all = pq.ParquetWriter(PRECLASSIFIED_FILE, fixed_schema, compression="zstd")
+        else:
+            # 强制 cast 到首个 batch 的 schema
+            table = table.cast(fixed_schema)
+
         writer_all.write_table(table)
 
         pending = out[out["needs_llm"] == True]
@@ -114,15 +210,16 @@ def main() -> None:
 
     if llm_rows:
         need_llm_df = pd.concat(llm_rows, ignore_index=True)
+        need_llm_df = normalize_batch_dtypes(need_llm_df)
     else:
-        need_llm_df = pd.DataFrame(columns=[])
+        need_llm_df = pd.DataFrame()
 
     need_llm_df.to_parquet(NEED_LLM_FILE, index=False)
 
-    total = sum(1 for _ in pq.ParquetFile(PRECLASSIFIED_FILE).iter_batches(batch_size=100000))
     print(f"[OK] 预分类文件：{PRECLASSIFIED_FILE}")
     print(f"[OK] 待送 Ollama 文件：{NEED_LLM_FILE}")
     print(f"[INFO] 待送 Ollama 数量：{len(need_llm_df)}")
+
 
 if __name__ == "__main__":
     main()
