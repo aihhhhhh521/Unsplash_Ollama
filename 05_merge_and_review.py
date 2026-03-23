@@ -17,6 +17,10 @@ def main() -> None:
 
     pre_df = pd.read_parquet(PRECLASSIFIED_FILE)
     ollama_df = pd.read_parquet(OLLAMA_RESULTS_FILE)
+    if "seq" in ollama_df.columns:
+        ollama_df = ollama_df.sort_values("seq").drop_duplicates("photo_id", keep="last")
+    else:
+        ollama_df = ollama_df.drop_duplicates("photo_id", keep="last")
 
     if len(ollama_df) == 0:
         merged = pre_df.copy()
@@ -62,6 +66,9 @@ def main() -> None:
         .sort_values(["count", "category"], ascending=[False, True])
     )
     stats.to_csv(STATS_FILE, index=False, encoding="utf-8-sig")
+
+    final_clean = merged[(merged["review_flag"] == False) & (merged["category"].notna())].copy()
+    final_clean.to_parquet(CLASSIFIED_FILE.parent / "classified_clean.parquet", index=False)
 
     print(f"[OK] 最终分类文件：{CLASSIFIED_FILE}")
     print(f"[OK] 待人工复核文件：{NEED_REVIEW_FILE}")
