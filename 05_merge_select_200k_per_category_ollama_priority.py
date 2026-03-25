@@ -2,25 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-05_merge_select_200k_per_category_ollama_priority.py
+05_merge_select_200k_per_category_ollama_priority_fixed_v2.py
 
-目标：
-1. 保留当前 05_merge_and_review_jsonl_by_category_thresholds.py 中的 Rule / Ollama 阈值逻辑不变。
-2. 先完成全量 merge，并得到“合格候选池（eligible）”。
-3. 在 eligible 中做二次筛选：
-   - 目标类别固定为 5 类：自然 / 城市、建筑 / 人像 / 室内 / 静物
-   - 每个类别单独保留约 40k（上限 40k）
-   - 宁缺毋滥：某类不足 40k 时，不跨类回填
-   - 同一类别内：Ollama 优先，其次按置信度高优先，再按 downloads / views 做弱排序
-4. 输出：
-   - classified.parquet                最终选中的样本（理论上最多约 200k）
-   - classified_all.parquet            全量 merge + eligibility + 选中状态审计表
-   - need_review.parquet               未入选样本（含不达阈值 + 达阈值但因类别配额未入选）
-   - rejected_or_low_conf.parquet      同上，便于兼容旧链路
-   - category_stats.csv                最终选中分布
-   - category_stats_all.csv            全量 merge 后分布
-   - category_reject_stats.csv         未入选原因统计
-   - category_selection_plan.csv       类别配额执行情况
+修复点：
+1. 最终保存前，把 category_final/category_confidence_final/category_source_final
+   覆盖回兼容旧链路的 category/category_confidence/category_source。
+   这样 export_photo_ids_by_category.py、06_download_pictures*.py 默认读取旧列时，
+   也能看到真正合并后的 ollama / rule 结果。
+2. 不再对 rejected_df 做整表排序，避免大表 ArrowMemoryError。
+3. 为兼容旧链路，补充/重算 review_flag。
 """
 
 from __future__ import annotations
@@ -43,16 +33,9 @@ from config import (
 from utils import ensure_exists
 
 
-# =========================
-# 目标规模与类别配置
-# =========================
 TARGET_PER_CATEGORY = 40_000
 TARGET_CATEGORIES = ["自然", "城市、建筑", "人像", "室内", "静物"]
 
-
-# =========================
-# 阈值配置：保持与当前 05 一致
-# =========================
 DEFAULT_RULE_MIN_CONFIDENCE = float(REVIEW_CONFIDENCE_THRESHOLD)
 CATEGORY_RULE_MIN_CONFIDENCE = {
     "自然": 0.98,
@@ -70,7 +53,6 @@ CATEGORY_OLLAMA_MIN_CONFIDENCE = {
     "室内": 0.60,
     "静物": 0.50,
 }
-
 
 OLLAMA_KEEP_COLS = [
     "photo_id",
@@ -145,7 +127,7 @@ def load_ollama_results_from_jsonl() -> pd.DataFrame:
     ollama_df["ollama_ok"] = ollama_df["ollama_ok"].astype("boolean")
     ollama_df["seq"] = pd.to_numeric(ollama_df["seq"], errors="coerce")
 
-    # 不强依赖 seq；直接按 JSONL 中最后一次出现为准
+    # 断点续跑时，保留 JSONL 中最后一次出现
     ollama_df = ollama_df.sort_values("_line_no")
     ollama_df = ollama_df.drop_duplicates(subset=["photo_id"], keep="last")
     return ollama_df.drop(columns=["_line_no"])
@@ -186,19 +168,16 @@ def build_merged_table(pre_df: pd.DataFrame, ollama_df: pd.DataFrame) -> pd.Data
 
     use_ollama = merged["needs_llm"] == True
 
-    # 默认保留 03 的 rule 结果
     merged["category_final"] = merged.get("category")
     merged["category_confidence_final"] = merged.get("category_confidence")
     merged["category_source_final"] = merged.get("category_source")
 
-    # needs_llm 样本：有有效 ollama 返回则严格优先使用 ollama
     has_ollama_label = merged["ollama_label"].notna() & (merged["ollama_label"].astype(str).str.strip() != "")
     use_ollama_effective = use_ollama & has_ollama_label
     merged.loc[use_ollama_effective, "category_final"] = merged.loc[use_ollama_effective, "ollama_label"]
     merged.loc[use_ollama_effective, "category_confidence_final"] = merged.loc[use_ollama_effective, "ollama_confidence"]
     merged.loc[use_ollama_effective, "category_source_final"] = "ollama"
 
-    # needs_llm 但没有有效 ollama 标签：回退仅用于审计，不进入最终保留
     fallback_mask = use_ollama & ~has_ollama_label
     merged.loc[fallback_mask, "category_final"] = merged.loc[fallback_mask, "rule_top1_label"]
     merged.loc[fallback_mask, "category_confidence_final"] = 0.20
@@ -214,9 +193,9 @@ def mark_eligibility(merged: pd.DataFrame) -> pd.DataFrame:
     merged["ollama_min_conf_threshold"] = merged["category_final"].map(get_ollama_threshold)
 
     merged["effective_min_conf_threshold"] = DEFAULT_RULE_MIN_CONFIDENCE
-    rule_mask = merged["category_source_final"] == "rule"
-    ollama_mask = merged["category_source_final"] == "ollama"
-    fallback_mask = merged["category_source_final"] == "fallback_rule"
+    rule_mask = merged["category_source_final"].fillna("").eq("rule")
+    ollama_mask = merged["category_source_final"].fillna("").eq("ollama")
+    fallback_mask = merged["category_source_final"].fillna("").eq("fallback_rule")
 
     merged.loc[rule_mask, "effective_min_conf_threshold"] = merged.loc[rule_mask, "rule_min_conf_threshold"]
     merged.loc[ollama_mask, "effective_min_conf_threshold"] = merged.loc[ollama_mask, "ollama_min_conf_threshold"]
@@ -239,48 +218,41 @@ def mark_eligibility(merged: pd.DataFrame) -> pd.DataFrame:
     merged.loc[low_rule, "reject_reason"] = "low_rule_confidence"
 
     merged["eligible"] = False
-    merged.loc[
-        rule_mask
-        & merged["category_final"].notna()
-        & ~low_rule,
-        "eligible",
-    ] = True
-    merged.loc[
-        ollama_mask
-        & merged["category_final"].notna()
-        & ~low_ollama,
-        "eligible",
-    ] = True
+    merged.loc[rule_mask & merged["category_final"].notna() & ~low_rule, "eligible"] = True
+    merged.loc[ollama_mask & merged["category_final"].notna() & ~low_ollama, "eligible"] = True
 
-    # 仅保留目标 5 类；其他类别不纳入最终 40k/类配额
     non_target_mask = merged["category_final"].notna() & ~merged["category_final"].astype(str).isin(TARGET_CATEGORIES)
     merged.loc[non_target_mask, "eligible"] = False
     merged.loc[non_target_mask & merged["reject_reason"].isna(), "reject_reason"] = "non_target_category"
 
+    is_ollama_source = merged["category_source_final"].fillna("").eq("ollama")
     merged["effective_confidence"] = np.where(
-        merged["category_source_final"].eq("ollama"),
+        is_ollama_source,
         merged["ollama_confidence"],
         merged["category_confidence_final"],
     )
     merged["effective_confidence"] = pd.to_numeric(merged["effective_confidence"], errors="coerce")
-
-    merged["source_priority"] = np.where(merged["category_source_final"].eq("ollama"), 1, 0)
+    merged["source_priority"] = np.where(is_ollama_source, 1, 0)
     merged["selection_status"] = np.where(merged["eligible"], "eligible", "rejected")
 
     return merged
 
 
 def sort_for_priority(df: pd.DataFrame, by_category: bool) -> pd.DataFrame:
+    if len(df) == 0:
+        return df
+
     sort_cols = []
     ascending = []
+
     if by_category:
         sort_cols.append("category_final")
         ascending.append(True)
 
     sort_cols.extend([
-        "source_priority",      # Ollama 优先
-        "effective_confidence", # 置信度高优先
-        "stats_downloads",      # 次级弱排序
+        "source_priority",
+        "effective_confidence",
+        "stats_downloads",
         "stats_views",
         "photo_id",
     ])
@@ -292,15 +264,7 @@ def sort_for_priority(df: pd.DataFrame, by_category: bool) -> pd.DataFrame:
 def select_topk_per_category(eligible_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     eligible_df = eligible_df.copy()
     if len(eligible_df) == 0:
-        empty_plan = pd.DataFrame(
-            columns=[
-                "category",
-                "available",
-                "target_quota",
-                "selected",
-                "shortfall",
-            ]
-        )
+        empty_plan = pd.DataFrame(columns=["category", "available", "target_quota", "selected", "shortfall"])
         return eligible_df, eligible_df, empty_plan
 
     eligible_sorted = sort_for_priority(eligible_df, by_category=True)
@@ -344,32 +308,43 @@ def select_topk_per_category(eligible_df: pd.DataFrame) -> tuple[pd.DataFrame, p
     if len(selected_df) > 0:
         selected_df = sort_for_priority(selected_df, by_category=True).copy()
 
-    if len(leftover_df) > 0:
-        leftover_df = sort_for_priority(leftover_df, by_category=True).copy()
-
+    # leftover/rejected 不再排序，避免大表内存爆炸
     return selected_df, leftover_df, plan_df
+
+
+def apply_compat_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["category"] = df.get("category_final")
+    df["category_confidence"] = pd.to_numeric(df.get("category_confidence_final"), errors="coerce")
+    df["category_source"] = df.get("category_source_final")
+
+    # 兼容旧链路：让 review_flag 反映“是否不满足最终资格”
+    if "eligible" in df.columns:
+        df["review_flag"] = ~df["eligible"].fillna(False)
+
+    return df
 
 
 def build_stats(merged: pd.DataFrame, final_df: pd.DataFrame, rejected_df: pd.DataFrame):
     stats_all = (
-        merged.groupby(["category_final", "category_source_final", "eligible"], dropna=False)
+        merged.groupby(["category", "category_source", "eligible"], dropna=False)
         .size()
         .reset_index(name="count")
-        .sort_values(["count", "category_final"], ascending=[False, True])
+        .sort_values(["count", "category"], ascending=[False, True])
     )
 
     stats_final = (
-        final_df.groupby(["category_final", "category_source_final", "selection_stage"], dropna=False)
+        final_df.groupby(["category", "category_source", "selection_stage"], dropna=False)
         .size()
         .reset_index(name="count")
-        .sort_values(["count", "category_final"], ascending=[False, True])
+        .sort_values(["count", "category"], ascending=[False, True])
     )
 
     reject_stats = (
-        rejected_df.groupby(["category_final", "category_source_final", "reject_reason", "selection_stage"], dropna=False)
+        rejected_df.groupby(["category", "category_source", "reject_reason", "selection_stage"], dropna=False)
         .size()
         .reset_index(name="count")
-        .sort_values(["count", "category_final"], ascending=[False, True])
+        .sort_values(["count", "category"], ascending=[False, True])
     )
 
     return stats_all, stats_final, reject_stats
@@ -393,7 +368,6 @@ def main() -> None:
     merged["selected_final"] = merged["photo_id"].astype(str).isin(selected_ids)
     merged.loc[merged["selected_final"], "selection_status"] = "selected"
 
-    # 已达阈值但超出该类别 40k 配额的样本
     eligible_not_selected_mask = (merged["eligible"] == True) & (merged["selected_final"] == False)
     merged.loc[eligible_not_selected_mask & merged["reject_reason"].isna(), "reject_reason"] = "not_selected_by_category_quota"
     merged.loc[eligible_not_selected_mask, "selection_status"] = "eligible_but_not_selected"
@@ -413,7 +387,11 @@ def main() -> None:
     rejected_df = merged[merged["selected_final"] == False].copy()
 
     final_df = sort_for_priority(final_df, by_category=True)
-    rejected_df = sort_for_priority(rejected_df, by_category=True)
+
+    # 关键修复：把最终融合列覆盖回旧列，兼容 export / download 等旧脚本
+    merged = apply_compat_columns(merged)
+    final_df = apply_compat_columns(final_df)
+    rejected_df = apply_compat_columns(rejected_df)
 
     final_df.to_parquet(CLASSIFIED_FILE, index=False)
     merged.to_parquet(CLASSIFIED_ALL_FILE, index=False)

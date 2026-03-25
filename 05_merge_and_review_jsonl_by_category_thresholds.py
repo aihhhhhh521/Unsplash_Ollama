@@ -27,21 +27,21 @@ OLLAMA_KEEP_COLS = [
 DEFAULT_RULE_MIN_CONFIDENCE = float(REVIEW_CONFIDENCE_THRESHOLD)
 
 CATEGORY_RULE_MIN_CONFIDENCE = {
-    "自然": float(REVIEW_CONFIDENCE_THRESHOLD),
-    "城市、建筑": float(REVIEW_CONFIDENCE_THRESHOLD),
-    "人像": float(REVIEW_CONFIDENCE_THRESHOLD),
-    "室内": float(REVIEW_CONFIDENCE_THRESHOLD),
-    "静物": float(REVIEW_CONFIDENCE_THRESHOLD),
+    "自然": 0.98,
+    "城市、建筑": 0.95,
+    "人像": 0.8,
+    "室内": 0.7,
+    "静物": 0.8,
 }
 
 DEFAULT_OLLAMA_MIN_CONFIDENCE = 0.75
 
 CATEGORY_OLLAMA_MIN_CONFIDENCE = {
-    "自然": 0.85,
-    "城市、建筑": 0.80,
-    "人像": 0.75,
-    "室内": 0.72,
-    "静物": 0.70,
+    "自然": 0.9,
+    "城市、建筑": 0.85,
+    "人像": 0.60,
+    "室内": 0.60,
+    "静物": 0.50,
 }
 
 CLASSIFIED_ALL_FILE = CLASSIFIED_FILE.with_name("classified_all.parquet")

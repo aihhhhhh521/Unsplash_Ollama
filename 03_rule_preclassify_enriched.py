@@ -112,11 +112,11 @@ STRICT_VOCAB = {
     "静物": {
         "strong": {
             "still life", "product photo", "food photography", "tabletop",
-            "product shot",
+            "product shot","food", "drink", "coffee", "tea", "fruit",
         },
         "weak": {
-            "food", "drink", "coffee", "tea", "fruit", "camera", "phone",
-            "laptop", "watch", "bottle", "cup", "plate", "product", "object",
+            "camera", "phone",
+        "laptop", "watch", "bottle", "cup", "plate", "product", "object",
             "book", "dessert", "meal",
         },
     },
