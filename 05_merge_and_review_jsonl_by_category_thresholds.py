@@ -21,17 +21,35 @@ OLLAMA_KEEP_COLS = [
     "seq",
 ]
 
-# 对 Ollama 结果额外加一道阈值，低于此分数的样本直接剔除到 need_review / rejected
-OLLAMA_MIN_CONFIDENCE = 0.5
+# =========================
+# 类别差异化阈值配置
+# =========================
+DEFAULT_RULE_MIN_CONFIDENCE = float(REVIEW_CONFIDENCE_THRESHOLD)
 
-# 额外输出，便于审计
+CATEGORY_RULE_MIN_CONFIDENCE = {
+    "自然": float(REVIEW_CONFIDENCE_THRESHOLD),
+    "城市、建筑": float(REVIEW_CONFIDENCE_THRESHOLD),
+    "人像": float(REVIEW_CONFIDENCE_THRESHOLD),
+    "室内": float(REVIEW_CONFIDENCE_THRESHOLD),
+    "静物": float(REVIEW_CONFIDENCE_THRESHOLD),
+}
+
+DEFAULT_OLLAMA_MIN_CONFIDENCE = 0.75
+
+CATEGORY_OLLAMA_MIN_CONFIDENCE = {
+    "自然": 0.85,
+    "城市、建筑": 0.80,
+    "人像": 0.75,
+    "室内": 0.72,
+    "静物": 0.70,
+}
+
 CLASSIFIED_ALL_FILE = CLASSIFIED_FILE.with_name("classified_all.parquet")
 REJECTED_FILE = CLASSIFIED_FILE.with_name("rejected_or_low_conf.parquet")
 ALL_STATS_FILE = STATS_FILE.with_name("category_stats_all.csv")
 
 
 def safe_to_csv(df: pd.DataFrame, path):
-    """Windows 下如果 csv 正被占用，自动写到带时间戳的新文件。"""
     try:
         df.to_csv(path, index=False, encoding="utf-8-sig")
         return path
@@ -43,7 +61,6 @@ def safe_to_csv(df: pd.DataFrame, path):
         df.to_csv(alt_file, index=False, encoding="utf-8-sig")
         print(f"[WARN] 目标文件被占用，已改存到: {alt_file}")
         return alt_file
-
 
 
 def load_ollama_results_from_jsonl() -> pd.DataFrame:
@@ -61,17 +78,25 @@ def load_ollama_results_from_jsonl() -> pd.DataFrame:
             ollama_df[col] = pd.NA
 
     ollama_df = ollama_df[OLLAMA_KEEP_COLS].copy()
-
     ollama_df["photo_id"] = ollama_df["photo_id"].astype(str)
     ollama_df["ollama_confidence"] = pd.to_numeric(ollama_df["ollama_confidence"], errors="coerce")
     ollama_df["ollama_ok"] = ollama_df["ollama_ok"].astype("boolean")
     ollama_df["seq"] = pd.to_numeric(ollama_df["seq"], errors="coerce")
     ollama_df = ollama_df.sort_values("seq", na_position="last")
-
-    # 断点续跑时 JSONL 里可能存在重复 photo_id，这里保留最后一次结果
     ollama_df = ollama_df.drop_duplicates(subset=["photo_id"], keep="last")
     return ollama_df
 
+
+def get_rule_threshold(category) -> float:
+    if pd.isna(category):
+        return DEFAULT_RULE_MIN_CONFIDENCE
+    return float(CATEGORY_RULE_MIN_CONFIDENCE.get(str(category), DEFAULT_RULE_MIN_CONFIDENCE))
+
+
+def get_ollama_threshold(category) -> float:
+    if pd.isna(category):
+        return DEFAULT_OLLAMA_MIN_CONFIDENCE
+    return float(CATEGORY_OLLAMA_MIN_CONFIDENCE.get(str(category), DEFAULT_OLLAMA_MIN_CONFIDENCE))
 
 
 def main() -> None:
@@ -109,55 +134,76 @@ def main() -> None:
             how="left",
         )
 
-    # ---------- 合并规则结果与 Ollama 结果 ----------
     use_ollama = merged["needs_llm"] == True
     merged["ollama_confidence"] = pd.to_numeric(merged["ollama_confidence"], errors="coerce")
     merged["category_confidence"] = pd.to_numeric(merged["category_confidence"], errors="coerce")
 
-    # 先用 Ollama 回填需要 LLM 的样本
     merged.loc[use_ollama, "category"] = merged.loc[use_ollama, "ollama_label"]
     merged.loc[use_ollama, "category_confidence"] = merged.loc[use_ollama, "ollama_confidence"]
     merged.loc[use_ollama, "category_source"] = "ollama"
 
-    # Ollama 尚未跑到 / 失败的样本，保留 fallback 信息，但不进入最终 classified.parquet
     failed = use_ollama & merged["category"].isna()
     merged.loc[failed, "category"] = merged.loc[failed, "rule_top1_label"]
     merged.loc[failed, "category_confidence"] = 0.2
     merged.loc[failed, "category_source"] = "fallback_rule"
 
+    merged["rule_min_conf_threshold"] = merged["category"].map(get_rule_threshold)
+    merged["ollama_min_conf_threshold"] = merged["category"].map(get_ollama_threshold)
+
+    merged["effective_min_conf_threshold"] = DEFAULT_RULE_MIN_CONFIDENCE
+    merged.loc[merged["category_source"] == "rule", "effective_min_conf_threshold"] = merged.loc[
+        merged["category_source"] == "rule", "rule_min_conf_threshold"
+    ]
+    merged.loc[merged["category_source"] == "ollama", "effective_min_conf_threshold"] = merged.loc[
+        merged["category_source"] == "ollama", "ollama_min_conf_threshold"
+    ]
+    merged.loc[merged["category_source"] == "fallback_rule", "effective_min_conf_threshold"] = 1.0
+
     merged["review_flag"] = (
         pd.to_numeric(merged["category_confidence"], errors="coerce").fillna(0)
-        < REVIEW_CONFIDENCE_THRESHOLD
+        < pd.to_numeric(merged["effective_min_conf_threshold"], errors="coerce").fillna(1.0)
     )
 
     merged["reject_reason"] = pd.NA
     merged.loc[merged["category"].isna(), "reject_reason"] = "missing_category"
     merged.loc[merged["category_source"] == "fallback_rule", "reject_reason"] = "fallback_rule"
+
     merged.loc[
         (merged["category_source"] == "ollama")
-        & (merged["ollama_confidence"].fillna(0) < OLLAMA_MIN_CONFIDENCE),
+        & (
+            merged["ollama_confidence"].fillna(0)
+            < pd.to_numeric(merged["ollama_min_conf_threshold"], errors="coerce").fillna(DEFAULT_OLLAMA_MIN_CONFIDENCE)
+        ),
         "reject_reason",
     ] = "low_ollama_confidence"
+
     merged.loc[
         (merged["category_source"] == "rule")
-        & (merged["category_confidence"].fillna(0) < REVIEW_CONFIDENCE_THRESHOLD),
+        & (
+            merged["category_confidence"].fillna(0)
+            < pd.to_numeric(merged["rule_min_conf_threshold"], errors="coerce").fillna(DEFAULT_RULE_MIN_CONFIDENCE)
+        ),
         "reject_reason",
     ] = "low_rule_confidence"
 
-    # ---------- 最终过滤逻辑 ----------
-    # 1. category 非空
-    # 2. review_flag=False
-    # 3. fallback_rule 全部剔除
-    # 4. ollama 必须 >= 0.70
     final_keep = (
         merged["category"].notna()
         & (merged["review_flag"] == False)
         & (merged["category_source"] != "fallback_rule")
         & (
-            (merged["category_source"] == "rule")
+            (
+                (merged["category_source"] == "rule")
+                & (
+                    merged["category_confidence"].fillna(0)
+                    >= pd.to_numeric(merged["rule_min_conf_threshold"], errors="coerce").fillna(DEFAULT_RULE_MIN_CONFIDENCE)
+                )
+            )
             | (
                 (merged["category_source"] == "ollama")
-                & (merged["ollama_confidence"].fillna(0) >= OLLAMA_MIN_CONFIDENCE)
+                & (
+                    merged["ollama_confidence"].fillna(0)
+                    >= pd.to_numeric(merged["ollama_min_conf_threshold"], errors="coerce").fillna(DEFAULT_OLLAMA_MIN_CONFIDENCE)
+                )
             )
         )
     )
@@ -165,10 +211,7 @@ def main() -> None:
     final_df = merged[final_keep].copy()
     rejected_df = merged[~final_keep].copy()
 
-    # 主输出：只保留真正通过阈值的最终结果
     final_df.to_parquet(CLASSIFIED_FILE, index=False)
-
-    # 审计输出：全部合并结果 + 被剔除结果
     merged.to_parquet(CLASSIFIED_ALL_FILE, index=False)
     rejected_df.to_parquet(NEED_REVIEW_FILE, index=False)
     rejected_df.to_parquet(REJECTED_FILE, index=False)
@@ -187,17 +230,36 @@ def main() -> None:
         .sort_values(["count", "category"], ascending=[False, True])
     )
 
+    reject_stats = (
+        rejected_df.groupby(["category", "category_source", "reject_reason"], dropna=False)
+        .size()
+        .reset_index(name="count")
+        .sort_values(["count", "category"], ascending=[False, True])
+    )
+
     all_stats_path = safe_to_csv(stats_all, ALL_STATS_FILE)
     final_stats_path = safe_to_csv(stats_final, STATS_FILE)
+    reject_stats_path = safe_to_csv(
+        reject_stats,
+        STATS_FILE.with_name("category_reject_stats.csv"),
+    )
 
     print(f"[INFO] Ollama 结果来源：{OLLAMA_RESULTS_JSONL}")
     print(f"[INFO] 已读取 Ollama 唯一 photo_id 数：{len(ollama_df)}")
-    print(f"[INFO] OLLAMA_MIN_CONFIDENCE = {OLLAMA_MIN_CONFIDENCE:.2f}")
-    print(f"[OK] 全量合并结果：{CLASSIFIED_ALL_FILE}")
+    print("[INFO] 分类别 Ollama 阈值：")
+    for k, v in CATEGORY_OLLAMA_MIN_CONFIDENCE.items():
+        print(f"  - {k}: {v:.2f}")
+    print()
+    print("[INFO] 分类别 Rule 阈值：")
+    for k, v in CATEGORY_RULE_MIN_CONFIDENCE.items():
+        print(f"  - {k}: {v:.2f}")
+
+    print(f"\n[OK] 全量合并结果：{CLASSIFIED_ALL_FILE}")
     print(f"[OK] 最终过滤后分类文件：{CLASSIFIED_FILE}")
     print(f"[OK] 被剔除/待复核文件：{NEED_REVIEW_FILE}")
     print(f"[OK] 全量统计：{all_stats_path}")
     print(f"[OK] 最终统计：{final_stats_path}")
+    print(f"[OK] 剔除原因统计：{reject_stats_path}")
     print()
     print(f"[SUMMARY] preclassified 总数: {len(pre_df)}")
     print(f"[SUMMARY] final classified 总数: {len(final_df)}")

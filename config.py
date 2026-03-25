@@ -67,11 +67,11 @@ LABELS = ["城市、建筑", "室内", "自然", "静物", "人像"]
 CATEGORY_VOCAB = {
     "人像": {
         "strong": {
-            "portrait", "face", "selfie", "model", "bride", "groom", "headshot",
+            "portrait", "face", "selfie", "model", "person", "people","headshot",
             "close up face", "close-up face", "profile portrait"
         },
         "weak": {
-            "person", "people", "human", "woman", "man", "girl", "boy", "child",
+            "human", "woman", "man", "girl", "boy", "child",
             "baby", "couple", "family", "male", "female"
         },
     },
@@ -106,10 +106,11 @@ CATEGORY_VOCAB = {
     },
     "静物": {
         "strong": {
-            "still life", "product photo", "food photography", "tabletop"
+            "still life", "product photo", "food photography", "food", "drink", "coffee",
+            "tea", "fruit", "tabletop"
         },
         "weak": {
-            "food", "drink", "coffee", "tea", "fruit", "camera", "phone", "laptop",
+            "camera", "phone", "laptop",
             "watch", "bottle", "cup", "plate", "table", "chair", "product", "object",
             "book", "car", "motorcycle"
         },
